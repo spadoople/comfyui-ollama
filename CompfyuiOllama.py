@@ -275,6 +275,7 @@ def _phoenix_apply_openinference_helpers():
             "token_total_attr": SpanAttributes.LLM_TOKEN_COUNT_TOTAL,
             "input_value_attr": SpanAttributes.INPUT_VALUE,
             "output_value_attr": SpanAttributes.OUTPUT_VALUE,
+            "session_id_attr": SpanAttributes.SESSION_ID,
         }
     except Exception:
         return None
@@ -367,6 +368,56 @@ def _phoenix_mark_ok(span) -> None:
         span.set_status(Status(StatusCode.OK))
     except Exception:
         pass
+
+
+def _phoenix_get_execution_context() -> tuple[str | None, str | None]:
+    try:
+        from comfy_execution.utils import get_executing_context
+
+        ctx = get_executing_context()
+        if ctx is None:
+            return None, None
+        return ctx.prompt_id, ctx.node_id
+    except Exception:
+        return None, None
+
+
+def _phoenix_resolve_session_id(*, chat_session_key: str | None = None) -> str | None:
+    if chat_session_key:
+        return f"ollama-chat:{chat_session_key}"
+    prompt_id, _ = _phoenix_get_execution_context()
+    if prompt_id:
+        return f"comfyui-prompt:{prompt_id}"
+    return None
+
+
+def _phoenix_session_context(session_id: str | None):
+    if not session_id:
+        return nullcontext(None)
+    try:
+        from phoenix.otel import using_session
+
+        return using_session(session_id=session_id)
+    except Exception:
+        return nullcontext(None)
+
+
+def _phoenix_apply_session_id(span, session_id: str | None) -> None:
+    if not session_id:
+        return
+    helpers = _phoenix_apply_openinference_helpers()
+    if helpers is not None:
+        _phoenix_set(span, helpers["session_id_attr"], session_id)
+    else:
+        _phoenix_set(span, "session.id", session_id)
+
+
+def _phoenix_apply_comfy_execution_attrs(span) -> None:
+    prompt_id, node_id = _phoenix_get_execution_context()
+    if prompt_id:
+        _phoenix_set(span, "comfy.prompt_id", prompt_id)
+    if node_id:
+        _phoenix_set(span, "comfy.node_id", node_id)
 # --- End Phoenix tracing helpers (Codex) ---
 
 # For type checking only. Torch is not installed at runtime
@@ -726,34 +777,38 @@ format: {format}
             "input.mime_type": "text/plain",
             "phoenix.content_capture": _phoenix_capture_content(),
         }
-        with _phoenix_start_span("comfyui.ollama.generate") as span:
-            for key, value in phoenix_attrs.items():
-                _phoenix_set(span, key, value)
-            input_messages = _phoenix_build_generate_messages(system, prompt)
-            _phoenix_begin_llm_span(span, model)
-            _phoenix_record_llm_messages(span, input_messages, None)
-            started_at = time.perf_counter()
-            try:
-                response = client.generate(
-                    model=model,
-                    system=system,
-                    prompt=prompt,
-                    images=images_b64,
-                    context=context,
-                    think=think,
-                    options=request_options,
-                    keep_alive= request_keep_alive,
-                    format=format,
-                )
-            except Exception as exc:
-                _phoenix_mark_error(span, exc)
-                raise
-            duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
-            response_text = _phoenix_extract_generate_text(response)
-            thinking_text = _phoenix_extract_generate_thinking(response) if think else None
-            _phoenix_record_ollama_result(span, response, duration_ms, request_options)
-            _phoenix_record_llm_messages(span, input_messages, response_text, thinking_text)
-            _phoenix_mark_ok(span)
+        session_id = _phoenix_resolve_session_id()
+        with _phoenix_session_context(session_id):
+            with _phoenix_start_span("comfyui.ollama.generate") as span:
+                _phoenix_apply_session_id(span, session_id)
+                _phoenix_apply_comfy_execution_attrs(span)
+                for key, value in phoenix_attrs.items():
+                    _phoenix_set(span, key, value)
+                input_messages = _phoenix_build_generate_messages(system, prompt)
+                _phoenix_begin_llm_span(span, model)
+                _phoenix_record_llm_messages(span, input_messages, None)
+                started_at = time.perf_counter()
+                try:
+                    response = client.generate(
+                        model=model,
+                        system=system,
+                        prompt=prompt,
+                        images=images_b64,
+                        context=context,
+                        think=think,
+                        options=request_options,
+                        keep_alive= request_keep_alive,
+                        format=format,
+                    )
+                except Exception as exc:
+                    _phoenix_mark_error(span, exc)
+                    raise
+                duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+                response_text = _phoenix_extract_generate_text(response)
+                thinking_text = _phoenix_extract_generate_thinking(response) if think else None
+                _phoenix_record_ollama_result(span, response, duration_ms, request_options)
+                _phoenix_record_llm_messages(span, input_messages, response_text, thinking_text)
+                _phoenix_mark_ok(span)
 
         if debug_print:
             print("\n--- ollama generate v2 response:")
@@ -1023,30 +1078,34 @@ format: {format}
             "input.mime_type": "text/plain",
             "phoenix.content_capture": _phoenix_capture_content(),
         }
-        with _phoenix_start_span("comfyui.ollama.chat") as span:
-            for key, value in phoenix_attrs.items():
-                _phoenix_set(span, key, value)
-            input_messages = _phoenix_sanitize_messages(messages_for_api)
-            _phoenix_begin_llm_span(span, model)
-            _phoenix_record_llm_messages(span, input_messages, None)
-            started_at = time.perf_counter()
-            try:
-                response = client.chat(
-                    model=model,
-                    messages=messages_for_api,
-                    options=request_options,
-                    keep_alive=request_keep_alive,
-                    format=ollama_format,
-                )
-            except Exception as exc:
-                _phoenix_mark_error(span, exc)
-                raise
-            duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
-            response_text = _phoenix_extract_chat_text(response)
-            thinking_text = _phoenix_extract_chat_thinking(response) if think else None
-            _phoenix_record_ollama_result(span, response, duration_ms, request_options)
-            _phoenix_record_llm_messages(span, input_messages, response_text, thinking_text)
-            _phoenix_mark_ok(span)
+        session_id = _phoenix_resolve_session_id(chat_session_key=session_key)
+        with _phoenix_session_context(session_id):
+            with _phoenix_start_span("comfyui.ollama.chat") as span:
+                _phoenix_apply_session_id(span, session_id)
+                _phoenix_apply_comfy_execution_attrs(span)
+                for key, value in phoenix_attrs.items():
+                    _phoenix_set(span, key, value)
+                input_messages = _phoenix_sanitize_messages(messages_for_api)
+                _phoenix_begin_llm_span(span, model)
+                _phoenix_record_llm_messages(span, input_messages, None)
+                started_at = time.perf_counter()
+                try:
+                    response = client.chat(
+                        model=model,
+                        messages=messages_for_api,
+                        options=request_options,
+                        keep_alive=request_keep_alive,
+                        format=ollama_format,
+                    )
+                except Exception as exc:
+                    _phoenix_mark_error(span, exc)
+                    raise
+                duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+                response_text = _phoenix_extract_chat_text(response)
+                thinking_text = _phoenix_extract_chat_thinking(response) if think else None
+                _phoenix_record_ollama_result(span, response, duration_ms, request_options)
+                _phoenix_record_llm_messages(span, input_messages, response_text, thinking_text)
+                _phoenix_mark_ok(span)
 
         if debug_print:
             print("\n--- ollama chat response:")

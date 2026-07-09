@@ -13,6 +13,8 @@ Install as a git clone so Manager updates do not overwrite customizations:
 ```bash
 cd /mnt/f/ComfyUI/custom_nodes
 mv comfyui-ollama comfyui-ollama.manager-backup   # if migrating from Manager
+# Move the backup OUT of custom_nodes (ComfyUI loads every folder here):
+mv comfyui-ollama.manager-backup /mnt/f/ComfyUI/custom_nodes/.disabled/
 git clone https://github.com/notarealemail/comfyui-ollama.git
 cd comfyui-ollama
 git remote add upstream https://github.com/stavsap/comfyui-ollama.git
@@ -40,6 +42,18 @@ Set before starting ComfyUI (system env, `.env` beside ComfyUI, or launcher scri
 | `PHOENIX_CONTENT_LIMIT` | `20000` | Max chars per text attribute |
 
 Homelab Phoenix UI: `https://phoenix.infra.realemail.app`
+
+## Sessions
+
+Phoenix **Sessions** group related traces into a conversation-style thread.
+
+| Node | Session ID | Groups |
+|------|------------|--------|
+| `OllamaGenerateV2` | `comfyui-prompt:<prompt_id>` | All Ollama generate calls in one ComfyUI queue run |
+| `OllamaChat` | `ollama-chat:<session_key>` | Multi-turn chat history across workflow runs |
+
+View in Phoenix → **Sessions** tab. Spans also include `comfy.prompt_id` and
+`comfy.node_id` for filtering in the Traces view.
 
 ## Verify
 

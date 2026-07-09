@@ -1,3 +1,10 @@
+09-07-2026 (notarealemail fork — Phoenix sessions):
+
+- Phoenix Sessions via OpenInference `session.id` and `using_session()`.
+- `OllamaGenerateV2`: groups traces by ComfyUI queue item (`comfyui-prompt:<prompt_id>`).
+- `OllamaChat`: groups multi-turn traces by chat history key (`ollama-chat:<session_key>`).
+- Spans also record `comfy.prompt_id` and `comfy.node_id` when ComfyUI execution context is available.
+
 09-07-2026 (notarealemail fork — Phoenix / homelab observability):
 
 - OpenInference-compliant Phoenix tracing for `OllamaGenerateV2` and `OllamaChat`
