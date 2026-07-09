@@ -2,6 +2,11 @@ from __future__ import annotations
 import copy
 import random
 import re
+import json
+import time
+from contextlib import nullcontext
+from urllib.parse import urlparse
+import ipaddress
 
 from ollama import Client
 import numpy as np
@@ -16,6 +21,353 @@ import os
 from typing import TYPE_CHECKING, Any, Literal
 from dataclasses import dataclass, field
 from pydantic.json_schema import JsonSchemaValue
+
+
+# --- Phoenix tracing helpers (Codex, local-content-safe) ---
+_PHOENIX_TRACER = None
+_PHOENIX_INIT_ATTEMPTED = False
+
+
+def _phoenix_truthy_env(name: str, default: str = "1") -> bool:
+    return os.getenv(name, default).strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _phoenix_endpoint() -> str | None:
+    return os.getenv("PHOENIX_COLLECTOR_ENDPOINT") or os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+
+
+def _phoenix_endpoint_is_local() -> bool:
+    endpoint = _phoenix_endpoint()
+    if not endpoint:
+        # Phoenix's helper defaults to localhost when no endpoint is supplied.
+        return True
+    try:
+        host = urlparse(endpoint).hostname or ""
+    except Exception:
+        return False
+
+    host_l = host.lower()
+    if host_l in {"localhost", "127.0.0.1", "::1"}:
+        return True
+
+    # Treat RFC1918/private LAN collector IPs as local for homelab tracing.
+    # This allows full prompt/response capture to a private Phoenix collector
+    # such as 192.168.x.x without permitting arbitrary public endpoints.
+    try:
+        ip = ipaddress.ip_address(host_l.strip("[]"))
+        return ip.is_private or ip.is_loopback
+    except ValueError:
+        return False
+
+
+def _get_phoenix_tracer():
+    """Return a Phoenix/OpenInference tracer, or None if tracing is unavailable.
+
+    This is lazy and fail-open so ComfyUI generation continues if Phoenix is
+    down, unconfigured, or the optional package is missing.
+    """
+    global _PHOENIX_TRACER, _PHOENIX_INIT_ATTEMPTED
+    if _PHOENIX_TRACER is not None:
+        return _PHOENIX_TRACER
+    if _PHOENIX_INIT_ATTEMPTED:
+        return None
+    _PHOENIX_INIT_ATTEMPTED = True
+
+    if not _phoenix_truthy_env("PHOENIX_ENABLED", "1"):
+        return None
+
+    try:
+        from phoenix.otel import register
+
+        kwargs = {
+            "project_name": os.getenv("PHOENIX_PROJECT_NAME", "comfyui-ollama"),
+            "batch": _phoenix_truthy_env("PHOENIX_BATCH", "0"),
+            "auto_instrument": False,
+            "verbose": _phoenix_truthy_env("PHOENIX_VERBOSE", "0"),
+        }
+        endpoint = _phoenix_endpoint()
+        api_key = os.getenv("PHOENIX_API_KEY")
+        if endpoint:
+            kwargs["endpoint"] = endpoint
+        if api_key:
+            kwargs["api_key"] = api_key
+
+        provider = register(**kwargs)
+        _PHOENIX_TRACER = provider.get_tracer("comfyui-ollama")
+        content_mode = "full local content" if _phoenix_capture_content() else "metadata only"
+        auth_mode = "present" if api_key else "missing"
+        print(f"[comfyui-ollama] Phoenix tracing enabled: project={kwargs['project_name']} endpoint={endpoint or 'default-local'} mode={content_mode} auth={auth_mode} batch={kwargs['batch']}")
+        return _PHOENIX_TRACER
+    except Exception as exc:
+        print(f"[comfyui-ollama] Phoenix tracing disabled: {exc}")
+        return None
+
+
+def _phoenix_capture_content() -> bool:
+    # Full prompt/response text is only emitted to local collectors. Remote
+    # endpoints receive metadata only.
+    return _phoenix_truthy_env("PHOENIX_CAPTURE_CONTENT", "1") and _phoenix_endpoint_is_local()
+
+
+def _phoenix_start_span(name: str):
+    tracer = _get_phoenix_tracer()
+    if tracer is None:
+        return nullcontext(None)
+    return tracer.start_as_current_span(name)
+
+
+def _phoenix_set(span, key: str, value) -> None:
+    if span is None or value is None:
+        return
+    try:
+        if isinstance(value, (dict, list, tuple)):
+            value = json.dumps(value, ensure_ascii=False, default=str)
+        span.set_attribute(key, value)
+    except Exception:
+        pass
+
+
+def _phoenix_set_text(span, key: str, value, limit: int | None = None) -> None:
+    if value is None or not _phoenix_capture_content():
+        return
+    text_value = str(value)
+    if limit is None:
+        try:
+            limit = int(os.getenv("PHOENIX_CONTENT_LIMIT", "20000"))
+        except Exception:
+            limit = 20000
+    if limit > 0 and len(text_value) > limit:
+        text_value = text_value[:limit] + f"\n...[truncated {len(str(value)) - limit} chars]"
+    _phoenix_set(span, key, text_value)
+
+
+def _phoenix_mark_error(span, exc: BaseException) -> None:
+    _phoenix_set(span, "error", True)
+    _phoenix_set(span, "exception.type", exc.__class__.__name__)
+    _phoenix_set(span, "exception.message", str(exc))
+    try:
+        from opentelemetry.trace import Status, StatusCode
+
+        span.set_status(Status(StatusCode.ERROR, str(exc)))
+        span.record_exception(exc)
+    except Exception:
+        pass
+
+
+def _phoenix_coerce_mapping(value) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        try:
+            return value.model_dump()
+        except Exception:
+            pass
+    return None
+
+
+def _phoenix_extract_generate_text(response) -> str | None:
+    data = _phoenix_coerce_mapping(response)
+    if data is not None:
+        text = data.get("response")
+        return None if text is None else str(text)
+    if hasattr(response, "response"):
+        text = getattr(response, "response", None)
+        return None if text is None else str(text)
+    return str(response) if response is not None else None
+
+
+def _phoenix_extract_generate_thinking(response) -> str | None:
+    data = _phoenix_coerce_mapping(response)
+    if data is not None:
+        thinking = data.get("thinking")
+        return None if thinking is None else str(thinking)
+    if hasattr(response, "thinking"):
+        thinking = getattr(response, "thinking", None)
+        return None if thinking is None else str(thinking)
+    return None
+
+
+def _phoenix_extract_chat_text(response) -> str | None:
+    if hasattr(response, "message"):
+        message = response.message
+        content = getattr(message, "content", None)
+        return None if content is None else str(content)
+    data = _phoenix_coerce_mapping(response)
+    if data is not None:
+        message = data.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            return None if content is None else str(content)
+    return str(response) if response is not None else None
+
+
+def _phoenix_extract_chat_thinking(response) -> str | None:
+    if hasattr(response, "message"):
+        thinking = getattr(response.message, "thinking", None)
+        return None if thinking is None else str(thinking)
+    data = _phoenix_coerce_mapping(response)
+    if data is not None:
+        message = data.get("message")
+        if isinstance(message, dict):
+            thinking = message.get("thinking")
+            return None if thinking is None else str(thinking)
+    return None
+
+
+def _phoenix_extract_token_counts(response) -> tuple[int | None, int | None]:
+    data = _phoenix_coerce_mapping(response)
+    if data is None:
+        return None, None
+    prompt_tokens = data.get("prompt_eval_count")
+    completion_tokens = data.get("eval_count")
+    return (
+        int(prompt_tokens) if prompt_tokens is not None else None,
+        int(completion_tokens) if completion_tokens is not None else None,
+    )
+
+
+def _phoenix_build_generate_messages(system: str | None, prompt: str | None) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    if prompt:
+        messages.append({"role": "user", "content": prompt})
+    return messages
+
+
+def _phoenix_sanitize_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, str]]:
+    sanitized: list[dict[str, str]] = []
+    if not messages:
+        return sanitized
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if content is None:
+            content = ""
+        text = str(content)
+        images = message.get("images")
+        if images:
+            text = f"{text}\n[{len(images)} image(s) attached]"
+        if role:
+            sanitized.append({"role": str(role), "content": text})
+    return sanitized
+
+
+def _phoenix_apply_openinference_helpers():
+    try:
+        from openinference.instrumentation._attributes import (
+            get_llm_input_message_attributes,
+            get_llm_output_message_attributes,
+        )
+        from openinference.semconv.trace import OpenInferenceSpanKindValues, SpanAttributes
+
+        return {
+            "get_input_attrs": get_llm_input_message_attributes,
+            "get_output_attrs": get_llm_output_message_attributes,
+            "span_kind_attr": SpanAttributes.OPENINFERENCE_SPAN_KIND,
+            "span_kind_llm": OpenInferenceSpanKindValues.LLM.value,
+            "model_name_attr": SpanAttributes.LLM_MODEL_NAME,
+            "invocation_params_attr": SpanAttributes.LLM_INVOCATION_PARAMETERS,
+            "token_prompt_attr": SpanAttributes.LLM_TOKEN_COUNT_PROMPT,
+            "token_completion_attr": SpanAttributes.LLM_TOKEN_COUNT_COMPLETION,
+            "token_total_attr": SpanAttributes.LLM_TOKEN_COUNT_TOTAL,
+            "input_value_attr": SpanAttributes.INPUT_VALUE,
+            "output_value_attr": SpanAttributes.OUTPUT_VALUE,
+        }
+    except Exception:
+        return None
+
+
+def _phoenix_begin_llm_span(span, model_name: str | None) -> None:
+    helpers = _phoenix_apply_openinference_helpers()
+    if helpers is None:
+        _phoenix_set(span, "openinference.span.kind", "LLM")
+        _phoenix_set(span, "llm.model_name", model_name)
+        return
+    _phoenix_set(span, helpers["span_kind_attr"], helpers["span_kind_llm"])
+    _phoenix_set(span, helpers["model_name_attr"], model_name)
+
+
+def _phoenix_record_llm_messages(
+    span,
+    input_messages: list[dict[str, str]],
+    output_text: str | None,
+    thinking: str | None = None,
+) -> None:
+    helpers = _phoenix_apply_openinference_helpers()
+    if helpers is None:
+        for index, message in enumerate(input_messages):
+            _phoenix_set_text(span, f"llm.input_messages.{index}.message.role", message.get("role"))
+            _phoenix_set_text(span, f"llm.input_messages.{index}.message.content", message.get("content"))
+        if output_text is not None:
+            _phoenix_set_text(span, "llm.output_messages.0.message.role", "assistant")
+            _phoenix_set_text(span, "llm.output_messages.0.message.content", output_text)
+        if thinking:
+            _phoenix_set_text(span, "llm.output.thinking", thinking)
+        return
+
+    for key, value in helpers["get_input_attrs"](input_messages).items():
+        _phoenix_set_text(span, key, value)
+
+    output_messages: list[dict[str, str]] = []
+    if output_text is not None:
+        output_messages.append({"role": "assistant", "content": output_text})
+    for key, value in helpers["get_output_attrs"](output_messages).items():
+        _phoenix_set_text(span, key, value)
+
+    if thinking:
+        _phoenix_set_text(span, "llm.output.thinking", thinking)
+
+    if input_messages:
+        _phoenix_set_text(span, helpers["input_value_attr"], json.dumps(input_messages, ensure_ascii=False))
+    if output_text is not None:
+        _phoenix_set_text(span, helpers["output_value_attr"], output_text)
+
+
+def _phoenix_record_ollama_result(
+    span,
+    response,
+    duration_ms: float,
+    request_options: dict[str, Any] | None,
+) -> None:
+    helpers = _phoenix_apply_openinference_helpers()
+    prompt_tokens, completion_tokens = _phoenix_extract_token_counts(response)
+    if helpers is not None:
+        if request_options:
+            _phoenix_set(span, helpers["invocation_params_attr"], request_options)
+        if prompt_tokens is not None:
+            _phoenix_set(span, helpers["token_prompt_attr"], prompt_tokens)
+        if completion_tokens is not None:
+            _phoenix_set(span, helpers["token_completion_attr"], completion_tokens)
+        if prompt_tokens is not None and completion_tokens is not None:
+            _phoenix_set(span, helpers["token_total_attr"], prompt_tokens + completion_tokens)
+    else:
+        if request_options:
+            _phoenix_set(span, "llm.invocation_parameters", request_options)
+        if prompt_tokens is not None:
+            _phoenix_set(span, "llm.token_count.prompt", prompt_tokens)
+        if completion_tokens is not None:
+            _phoenix_set(span, "llm.token_count.completion", completion_tokens)
+
+    _phoenix_set(span, "llm.duration_ms", duration_ms)
+
+    data = _phoenix_coerce_mapping(response)
+    if data is not None:
+        for key in ("total_duration", "load_duration", "prompt_eval_duration", "eval_duration", "done_reason"):
+            if data.get(key) is not None:
+                _phoenix_set(span, f"ollama.{key}", data.get(key))
+
+
+def _phoenix_mark_ok(span) -> None:
+    try:
+        from opentelemetry.trace import Status, StatusCode
+
+        span.set_status(Status(StatusCode.OK))
+    except Exception:
+        pass
+# --- End Phoenix tracing helpers (Codex) ---
 
 # For type checking only. Torch is not installed at runtime
 if TYPE_CHECKING:
@@ -360,17 +712,48 @@ format: {format}
 ---------------------------------------------------------
 """)
 
-        response = client.generate(
-            model=model,
-            system=system,
-            prompt=prompt,
-            images=images_b64,
-            context=context,
-            think=think,
-            options=request_options,
-            keep_alive= request_keep_alive,
-            format=format,
-        )
+        phoenix_attrs = {
+            "comfy.node.type": "OllamaGenerateV2",
+            "llm.provider": "ollama",
+            "llm.system": "ollama",
+            "llm.model_name": model,
+            "ollama.url": url,
+            "ollama.keep_alive": request_keep_alive,
+            "ollama.format": format,
+            "ollama.think": bool(think),
+            "ollama.has_context": context is not None,
+            "ollama.image_count": 0 if images_b64 is None else len(images_b64),
+            "input.mime_type": "text/plain",
+            "phoenix.content_capture": _phoenix_capture_content(),
+        }
+        with _phoenix_start_span("comfyui.ollama.generate") as span:
+            for key, value in phoenix_attrs.items():
+                _phoenix_set(span, key, value)
+            input_messages = _phoenix_build_generate_messages(system, prompt)
+            _phoenix_begin_llm_span(span, model)
+            _phoenix_record_llm_messages(span, input_messages, None)
+            started_at = time.perf_counter()
+            try:
+                response = client.generate(
+                    model=model,
+                    system=system,
+                    prompt=prompt,
+                    images=images_b64,
+                    context=context,
+                    think=think,
+                    options=request_options,
+                    keep_alive= request_keep_alive,
+                    format=format,
+                )
+            except Exception as exc:
+                _phoenix_mark_error(span, exc)
+                raise
+            duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            response_text = _phoenix_extract_generate_text(response)
+            thinking_text = _phoenix_extract_generate_thinking(response) if think else None
+            _phoenix_record_ollama_result(span, response, duration_ms, request_options)
+            _phoenix_record_llm_messages(span, input_messages, response_text, thinking_text)
+            _phoenix_mark_ok(span)
 
         if debug_print:
             print("\n--- ollama generate v2 response:")
@@ -625,13 +1008,45 @@ format: {format}
         if images_b64 is not None:
             messages_for_api[-1]["images"] = images_b64
 
-        response = client.chat(
-            model=model,
-            messages=messages_for_api,
-            options=request_options,
-            keep_alive=request_keep_alive,
-            format=ollama_format,
-        )
+        phoenix_attrs = {
+            "comfy.node.type": "OllamaChat",
+            "llm.provider": "ollama",
+            "llm.system": "ollama",
+            "llm.model_name": model,
+            "ollama.url": url,
+            "ollama.keep_alive": request_keep_alive,
+            "ollama.format": ollama_format or "",
+            "ollama.think": bool(think),
+            "ollama.session_key": session_key,
+            "ollama.message_count": len(messages_for_api),
+            "ollama.image_count": 0 if images_b64 is None else len(images_b64),
+            "input.mime_type": "text/plain",
+            "phoenix.content_capture": _phoenix_capture_content(),
+        }
+        with _phoenix_start_span("comfyui.ollama.chat") as span:
+            for key, value in phoenix_attrs.items():
+                _phoenix_set(span, key, value)
+            input_messages = _phoenix_sanitize_messages(messages_for_api)
+            _phoenix_begin_llm_span(span, model)
+            _phoenix_record_llm_messages(span, input_messages, None)
+            started_at = time.perf_counter()
+            try:
+                response = client.chat(
+                    model=model,
+                    messages=messages_for_api,
+                    options=request_options,
+                    keep_alive=request_keep_alive,
+                    format=ollama_format,
+                )
+            except Exception as exc:
+                _phoenix_mark_error(span, exc)
+                raise
+            duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            response_text = _phoenix_extract_chat_text(response)
+            thinking_text = _phoenix_extract_chat_thinking(response) if think else None
+            _phoenix_record_ollama_result(span, response, duration_ms, request_options)
+            _phoenix_record_llm_messages(span, input_messages, response_text, thinking_text)
+            _phoenix_mark_ok(span)
 
         if debug_print:
             print("\n--- ollama chat response:")

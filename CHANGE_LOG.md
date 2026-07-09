@@ -1,3 +1,12 @@
+09-07-2026 (notarealemail fork — Phoenix / homelab observability):
+
+- OpenInference-compliant Phoenix tracing for `OllamaGenerateV2` and `OllamaChat`
+  (`openinference.span.kind=LLM`, token counts, input/output messages).
+- Fix Ollama 0.6 Pydantic response handling (no longer stringifies full `context`
+  into trace payloads).
+- Optional deps: `arize-phoenix-otel`, `openinference-semantic-conventions`.
+- See [PHOENIX.md](PHOENIX.md) for env vars and upstream merge workflow.
+
 23-10-2025:
 
 - Fixed Ollama cloud model support with new OllamaChat node

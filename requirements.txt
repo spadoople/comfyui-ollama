@@ -1,2 +1,6 @@
 ollama==0.6.0
 dotenv
+
+# Optional Phoenix tracing (set PHOENIX_ENABLED=1 and env vars below)
+arize-phoenix-otel>=0.16
+openinference-semantic-conventions>=0.1.30

@@ -4,3 +4,5 @@ saved_context
 __pycache__
 .env
 .vscode
+.tracking
+*.bak*

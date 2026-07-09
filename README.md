@@ -4,6 +4,11 @@ Custom [ComfyUI](https://github.com/comfyanonymous/ComfyUI) Nodes for interactin
 
 Integrate the power of LLMs into ComfyUI workflows easily or just experiment with LLM inference.
 
+> **notarealemail fork:** Adds Phoenix/OpenInference tracing for homelab LLM
+> observability. Install via **git clone** (not ComfyUI Manager) — see
+> [PHOENIX.md](PHOENIX.md). Upstream:
+> [stavsap/comfyui-ollama](https://github.com/stavsap/comfyui-ollama).
+
 To use this properly, you would need a running Ollama server reachable from the host that is running ComfyUI.
 
 <a href="https://www.buymeacoffee.com/stavsapq" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/default-orange.png" alt="Buy Me A Coffee" height="40" width="174"></a>
