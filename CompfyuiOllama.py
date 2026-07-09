@@ -276,6 +276,8 @@ def _phoenix_apply_openinference_helpers():
             "input_value_attr": SpanAttributes.INPUT_VALUE,
             "output_value_attr": SpanAttributes.OUTPUT_VALUE,
             "session_id_attr": SpanAttributes.SESSION_ID,
+            "tags_attr": SpanAttributes.TAG_TAGS,
+            "metadata_attr": SpanAttributes.METADATA,
         }
     except Exception:
         return None
@@ -370,6 +372,56 @@ def _phoenix_mark_ok(span) -> None:
         pass
 
 
+def _phoenix_session_prefix() -> str:
+    return os.getenv("PHOENIX_SESSION_PREFIX", "").strip().strip(":")
+
+
+def _phoenix_extra_tags() -> list[str]:
+    raw = os.getenv("PHOENIX_TAGS", "").strip()
+    if not raw:
+        return []
+    return [tag.strip() for tag in raw.split(",") if tag.strip()]
+
+
+def _phoenix_sanitize_tag_value(value: str) -> str:
+    cleaned = re.sub(r"[^\w.\-/]+", "-", str(value).strip())
+    return cleaned[:128] if cleaned else "unknown"
+
+
+def _phoenix_build_tags(*, node_type: str, model_name: str | None) -> list[str]:
+    tags = [f"node-type:{node_type}"]
+    if model_name:
+        tags.append(f"model:{_phoenix_sanitize_tag_value(model_name)}")
+    prompt_id, _ = _phoenix_get_execution_context()
+    if prompt_id:
+        tags.append(f"workflow:{prompt_id}")
+    tags.extend(_phoenix_extra_tags())
+    # Preserve order but drop duplicates.
+    return list(dict.fromkeys(tags))
+
+
+def _phoenix_build_trace_metadata(
+    *,
+    node_type: str,
+    model_name: str | None,
+    chat_session_key: str | None = None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"comfy.node.type": node_type}
+    if model_name:
+        metadata["llm.model_name"] = model_name
+    prompt_id, node_id = _phoenix_get_execution_context()
+    if prompt_id:
+        metadata["comfy.prompt_id"] = prompt_id
+    if node_id:
+        metadata["comfy.node_id"] = node_id
+    if chat_session_key:
+        metadata["ollama.session_key"] = chat_session_key
+    prefix = _phoenix_session_prefix()
+    if prefix:
+        metadata["phoenix.session_prefix"] = prefix
+    return metadata
+
+
 def _phoenix_get_execution_context() -> tuple[str | None, str | None]:
     try:
         from comfy_execution.utils import get_executing_context
@@ -383,12 +435,38 @@ def _phoenix_get_execution_context() -> tuple[str | None, str | None]:
 
 
 def _phoenix_resolve_session_id(*, chat_session_key: str | None = None) -> str | None:
+    session_id: str | None
     if chat_session_key:
-        return f"ollama-chat:{chat_session_key}"
-    prompt_id, _ = _phoenix_get_execution_context()
-    if prompt_id:
-        return f"comfyui-prompt:{prompt_id}"
-    return None
+        session_id = f"ollama-chat:{chat_session_key}"
+    else:
+        prompt_id, _ = _phoenix_get_execution_context()
+        session_id = f"comfyui-prompt:{prompt_id}" if prompt_id else None
+    prefix = _phoenix_session_prefix()
+    if session_id and prefix:
+        session_id = f"{prefix}:{session_id}"
+    return session_id
+
+
+def _phoenix_trace_context(
+    session_id: str | None,
+    tags: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+):
+    if not session_id and not tags and not metadata:
+        return nullcontext(None)
+    try:
+        from phoenix.otel import using_attributes
+
+        kwargs: dict[str, Any] = {}
+        if session_id:
+            kwargs["session_id"] = session_id
+        if tags:
+            kwargs["tags"] = tags
+        if metadata:
+            kwargs["metadata"] = metadata
+        return using_attributes(**kwargs)
+    except Exception:
+        return _phoenix_session_context(session_id)
 
 
 def _phoenix_session_context(session_id: str | None):
@@ -400,6 +478,26 @@ def _phoenix_session_context(session_id: str | None):
         return using_session(session_id=session_id)
     except Exception:
         return nullcontext(None)
+
+
+def _phoenix_apply_trace_attrs(
+    span,
+    session_id: str | None,
+    tags: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    _phoenix_apply_session_id(span, session_id)
+    helpers = _phoenix_apply_openinference_helpers()
+    if tags:
+        if helpers is not None:
+            _phoenix_set(span, helpers["tags_attr"], tags)
+        else:
+            _phoenix_set(span, "tag.tags", tags)
+    if metadata:
+        if helpers is not None:
+            _phoenix_set(span, helpers["metadata_attr"], metadata)
+        else:
+            _phoenix_set(span, "metadata", metadata)
 
 
 def _phoenix_apply_session_id(span, session_id: str | None) -> None:
@@ -778,9 +876,14 @@ format: {format}
             "phoenix.content_capture": _phoenix_capture_content(),
         }
         session_id = _phoenix_resolve_session_id()
-        with _phoenix_session_context(session_id):
+        trace_tags = _phoenix_build_tags(node_type="OllamaGenerateV2", model_name=model)
+        trace_metadata = _phoenix_build_trace_metadata(
+            node_type="OllamaGenerateV2",
+            model_name=model,
+        )
+        with _phoenix_trace_context(session_id, trace_tags, trace_metadata):
             with _phoenix_start_span("comfyui.ollama.generate") as span:
-                _phoenix_apply_session_id(span, session_id)
+                _phoenix_apply_trace_attrs(span, session_id, trace_tags, trace_metadata)
                 _phoenix_apply_comfy_execution_attrs(span)
                 for key, value in phoenix_attrs.items():
                     _phoenix_set(span, key, value)
@@ -1079,9 +1182,15 @@ format: {format}
             "phoenix.content_capture": _phoenix_capture_content(),
         }
         session_id = _phoenix_resolve_session_id(chat_session_key=session_key)
-        with _phoenix_session_context(session_id):
+        trace_tags = _phoenix_build_tags(node_type="OllamaChat", model_name=model)
+        trace_metadata = _phoenix_build_trace_metadata(
+            node_type="OllamaChat",
+            model_name=model,
+            chat_session_key=session_key,
+        )
+        with _phoenix_trace_context(session_id, trace_tags, trace_metadata):
             with _phoenix_start_span("comfyui.ollama.chat") as span:
-                _phoenix_apply_session_id(span, session_id)
+                _phoenix_apply_trace_attrs(span, session_id, trace_tags, trace_metadata)
                 _phoenix_apply_comfy_execution_attrs(span)
                 for key, value in phoenix_attrs.items():
                     _phoenix_set(span, key, value)

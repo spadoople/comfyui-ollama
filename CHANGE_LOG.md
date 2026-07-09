@@ -1,3 +1,11 @@
+09-07-2026 (notarealemail fork — Phoenix tags and session prefix):
+
+- OpenInference `tag.tags` on every span: `node-type`, `model`, `workflow`, plus
+  optional `PHOENIX_TAGS`.
+- Optional `PHOENIX_SESSION_PREFIX` prepended to session IDs for namespacing.
+- Structured trace `metadata` JSON with ComfyUI prompt/node context.
+- Document UmeAiRT `scripts/phoenix_session_prefix` and `scripts/phoenix_tags` files.
+
 09-07-2026 (notarealemail fork — Phoenix sessions):
 
 - Phoenix Sessions via OpenInference `session.id` and `using_session()`.

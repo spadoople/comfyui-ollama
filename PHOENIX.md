@@ -40,8 +40,22 @@ Set before starting ComfyUI (system env, `.env` beside ComfyUI, or launcher scri
 | `PHOENIX_CAPTURE_CONTENT` | `1` | Full prompt/response on private LAN collectors |
 | `PHOENIX_BATCH` | `0` | `0` = export each span immediately (easier debugging) |
 | `PHOENIX_CONTENT_LIMIT` | `20000` | Max chars per text attribute |
+| `PHOENIX_SESSION_PREFIX` | `flux-lora` | Optional namespace prepended to session IDs |
+| `PHOENIX_TAGS` | `lora-select,dev` | Extra comma-separated Phoenix filter tags |
 
 Homelab Phoenix UI: `https://phoenix.infra.realemail.app`
+
+### UmeAiRT launcher file pattern
+
+If you start ComfyUI with `UmeAiRT-Start-ComfyUI.bat`, these one-line files under
+`F:\ComfyUI\scripts\` are loaded automatically (same pattern as the API key):
+
+| File | Sets |
+|------|------|
+| `phoenix_collector_endpoint` | `PHOENIX_COLLECTOR_ENDPOINT` |
+| `phoenix_api_key` | `PHOENIX_API_KEY` |
+| `phoenix_session_prefix` | `PHOENIX_SESSION_PREFIX` |
+| `phoenix_tags` | `PHOENIX_TAGS` |
 
 ## Sessions
 
@@ -51,6 +65,21 @@ Phoenix **Sessions** group related traces into a conversation-style thread.
 |------|------------|--------|
 | `OllamaGenerateV2` | `comfyui-prompt:<prompt_id>` | All Ollama generate calls in one ComfyUI queue run |
 | `OllamaChat` | `ollama-chat:<session_key>` | Multi-turn chat history across workflow runs |
+
+With `PHOENIX_SESSION_PREFIX=flux-lora`, session IDs become
+`flux-lora:comfyui-prompt:<prompt_id>`.
+
+## Tags and metadata
+
+Every traced span gets Phoenix filter tags:
+
+- `node-type:OllamaGenerateV2` or `node-type:OllamaChat`
+- `model:<ollama-model-name>`
+- `workflow:<comfyui-prompt-id>` when ComfyUI execution context is available
+- Any extras from `PHOENIX_TAGS` (comma-separated)
+
+OpenInference `metadata` JSON on each span includes `comfy.prompt_id`,
+`comfy.node_id`, and `llm.model_name` for structured filtering.
 
 View in Phoenix → **Sessions** tab. Spans also include `comfy.prompt_id` and
 `comfy.node_id` for filtering in the Traces view.
