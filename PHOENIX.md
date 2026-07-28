@@ -1,4 +1,4 @@
-# Phoenix tracing (notarealemail fork)
+# Phoenix tracing (spadoople fork)
 
 This fork adds optional [Arize Phoenix](https://github.com/Arize-ai/phoenix) tracing
 for `OllamaGenerateV2` and `OllamaChat`. Tracing is **fail-open**: if Phoenix is
@@ -15,7 +15,7 @@ cd /mnt/f/ComfyUI/custom_nodes
 mv comfyui-ollama comfyui-ollama.manager-backup   # if migrating from Manager
 # Move the backup OUT of custom_nodes (ComfyUI loads every folder here):
 mv comfyui-ollama.manager-backup /mnt/f/ComfyUI/custom_nodes/.disabled/
-git clone https://github.com/notarealemail/comfyui-ollama.git
+git clone https://github.com/spadoople/comfyui-ollama.git
 cd comfyui-ollama
 git remote add upstream https://github.com/stavsap/comfyui-ollama.git
 
@@ -23,7 +23,7 @@ git remote add upstream https://github.com/stavsap/comfyui-ollama.git
 ```
 
 Or use the homelab helper: `scripts/workstation/install-comfyui-ollama.sh` in
-[notarealemail/homelab](https://github.com/notarealemail/homelab).
+[spadoople/homelab](https://github.com/spadoople/homelab).
 
 **Do not** re-enable ComfyUI Manager auto-update for this node.
 

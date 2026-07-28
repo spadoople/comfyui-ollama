@@ -4,7 +4,7 @@ Custom [ComfyUI](https://github.com/comfyanonymous/ComfyUI) Nodes for interactin
 
 Integrate the power of LLMs into ComfyUI workflows easily or just experiment with LLM inference.
 
-> **notarealemail fork:** Adds Phoenix/OpenInference tracing for homelab LLM
+> **spadoople fork:** Adds Phoenix/OpenInference tracing for homelab LLM
 > observability. Install via **git clone** (not ComfyUI Manager) — see
 > [PHOENIX.md](PHOENIX.md). Upstream:
 > [stavsap/comfyui-ollama](https://github.com/stavsap/comfyui-ollama).
